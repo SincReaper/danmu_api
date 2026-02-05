@@ -605,7 +605,7 @@ API 支持返回 Bilibili 标准 XML 格式的弹幕数据，通过查询参数 
 <a href="https://github.com/huangxd-/danmu_api/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=huangxd-/danmu_api" alt="contributors" />
 </a>
-
+更新 sinccc
 ### 📈项目 Star 数增长趋势
 #### Star History
 [![Star History Chart](https://api.star-history.com/svg?repos=huangxd-/danmu_api&type=Date)](https://www.star-history.com/#huangxd-/danmu_api&Date)
