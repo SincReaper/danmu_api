@@ -5,7 +5,7 @@ import { httpGet, httpGetWithStreamCheck } from "../utils/http-util.js";
 import { parseDanmakuBase64, md5, convertToAsciiSum } from "../utils/codec-util.js";
 import { generateValidStartDate } from "../utils/time-util.js";
 import { addAnime, removeEarliestAnime } from "../utils/cache-util.js";
-import { titleMatches } from "../utils/common-util.js";
+import { titleMatches, getExplicitSeasonNumber, extractSeasonNumberFromAnimeTitle } from "../utils/common-util.js";
 import { SegmentListResponse } from '../models/dandan-model.js';
 import { simplized } from "../utils/zh-util.js";
 import { getTmdbJaOriginalTitle, smartTitleReplace } from "../utils/tmdb-util.js";
@@ -31,28 +31,27 @@ export default class BilibiliSource extends BaseSource {
 
   // 解析 b23.tv 短链接
   async resolveB23Link(shortUrl) {
+    let timeoutId;
     try {
       log("info", `正在解析 b23.tv 短链接: ${shortUrl}`);
 
-      // 设置超时时间（默认5秒）
-      const timeout = parseInt(globals.vodRequestTimeout);
+      // b23.tv 第一跳会在 Location 中给出真实 B 站地址。
+      // 只读取第一跳，避免继续访问最终页面时被 B 站页面风控返回 412。
+      const timeout = parseInt(globals.vodRequestTimeout || '5000', 10) || 5000;
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), timeout);
-
-      // 使用原生 fetch 获取重定向后的 URL
-      // fetch 默认会自动跟踪重定向，response.url 会是最终的 URL
-      const response = await httpGet(shortUrl, {
+      timeoutId = setTimeout(() => controller.abort(), timeout);
+      const fetchFn = typeof fetch === 'function' ? fetch : (await import('node-fetch')).default;
+      const response = await fetchFn(shortUrl, {
+        method: 'GET',
         headers: {
           "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         },
         signal: controller.signal,
-        redirect: 'follow'
+        redirect: 'manual'
       });
 
-      clearTimeout(timeoutId);
-
-      // 获取最终的 URL（重定向后的 URL）
-      const finalUrl = response.url;
+      const location = response.headers?.get?.('location') || response.headers?.get?.('Location');
+      const finalUrl = location ? new URL(location, shortUrl).toString() : response.url;
       if (finalUrl && finalUrl !== shortUrl) {
         log("info", `b23.tv 短链接已解析为: ${finalUrl}`);
         return finalUrl;
@@ -63,6 +62,8 @@ export default class BilibiliSource extends BaseSource {
     } catch (error) {
       log("error", "解析 b23.tv 短链接失败:", error);
       return shortUrl; // 如果出错，返回原 URL
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
     }
   }
 
@@ -287,7 +288,7 @@ export default class BilibiliSource extends BaseSource {
     let localMatches = [];
     if (globals.useBangumiData) {
       // 获取本地匹配条目
-      localMatches = searchBangumiData(keyword, [
+      localMatches = await searchBangumiData(keyword, [
         'bilibili', 'bilibili_hk_mo_tw', 'bilibili_hk_mo', 'bilibili_tw'
       ]);
       log("info", `[Bilibili] Bangumi-Data 本地命中 ${localMatches.length} 条数据`);
@@ -320,15 +321,14 @@ export default class BilibiliSource extends BaseSource {
       const seenIds = new Set();
       const consumedLocalMdIds = new Set();
 
-      // 处理网络结果：对齐本地数据进行信息增强
+      // 对齐 Bangumi Data 进行信息强化
       for (const item of networkResults) {
         if (!item || (!item.mediaId && !item.season_id)) continue;
 
-        // 对齐逻辑：优先匹配 mdId，其次匹配原名
-        const matchedLocal = localMatches.find(m => 
-            (item.mdId && item.mdId === `md${m.siteId}`) || 
-            (item.org_title && m.title === item.org_title)
-        );
+        // 对齐逻辑：优先精准匹配 mdId，其次降级匹配原名
+        const matchedLocal = 
+            localMatches.find(m => item.mdId && item.mdId === `md${m.siteId}`) || 
+            localMatches.find(m => item.org_title && m.title === item.org_title);
 
         if (matchedLocal) {
             const displayTitle = matchedLocal.titles.find(t => t && t.includes(keyword)) || matchedLocal.titles[1] || matchedLocal.title;
@@ -553,7 +553,15 @@ export default class BilibiliSource extends BaseSource {
     return [];
   }
 
-  async handleAnimes(sourceAnimes, queryTitle, curAnimes, detailStore = null) {
+  /**
+   * 处理搜索结果
+   * @param {Array} sourceAnimes 原始数据
+   * @param {string} queryTitle 关键词
+   * @param {Array} curAnimes 结果池
+   * @param {Map} detailStore 详情缓存
+   * @param {number|null} querySeason 目标季度
+   */
+  async handleAnimes(sourceAnimes, queryTitle, curAnimes, detailStore = null, querySeason = null) {
     const tmpAnimes = [];
 
     // 添加错误处理，确保sourceAnimes是数组
@@ -577,10 +585,33 @@ export default class BilibiliSource extends BaseSource {
     const cnAlias = sourceAnimes.length > 0 ? sourceAnimes[0]._tmdbCnAlias : null;
     smartTitleReplace(sourceAnimes, cnAlias);
 
-    const processPromises = sourceAnimes
-      // 港澳台资源不做严格标题匹配，其他资源根据当前标题或别名池（已包含原标题和 org_title）验证查询匹配度
-      .filter(anime => anime.isOversea || titleMatches(anime.title, queryTitle) || (anime.aliases && anime.aliases.some(alias => titleMatches(alias, queryTitle))))
-      .map(async (anime) => {
+    // 基础标题与季度匹配过滤
+    // 港澳台资源不做严格标题匹配，其他资源根据当前标题或别名池（已包含原标题和 org_title）验证查询匹配度
+    let filteredAnimes = sourceAnimes.filter(anime => 
+        anime.isOversea || 
+        titleMatches(anime.title, queryTitle, querySeason) || 
+        (anime.aliases && anime.aliases.some(alias => titleMatches(alias, queryTitle, querySeason)))
+    );
+
+    // 提取搜索词中的明确季度信息或使用传入的季度参数
+    const resolvedQuerySeason = querySeason !== null ? querySeason : getExplicitSeasonNumber(queryTitle);
+
+    // 初始列表预过滤机制：若用户指定了季度，优先检查结果中是否已包含匹配项
+    if (resolvedQuerySeason !== null) {
+      const seasonFiltered = filteredAnimes.filter(anime => {
+        const titleToCheck = anime._displayTitle || anime.title;
+        const s = extractSeasonNumberFromAnimeTitle(titleToCheck).season;
+        return s === resolvedQuerySeason || (resolvedQuerySeason === 1 && s === null);
+      });
+
+      // 如果已命中目标，减少详情请求量
+      if (seasonFiltered.length > 0) {
+        filteredAnimes = seasonFiltered;
+        log("info", `[Bilibili] 结果已命中目标季(第${resolvedQuerySeason}季)，跳过非目标季相关请求`);
+      }
+    }
+
+    const processPromises = filteredAnimes.map(async (anime) => {
         try {
           let links = [];
 
