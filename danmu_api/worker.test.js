@@ -5,8 +5,10 @@ dotenv.config();
 import test from 'node:test';
 import assert from 'node:assert';
 import { handleRequest } from './worker.js';
-import { extractTitleSeasonEpisode, getBangumi, getComment, matchAnime, searchAnime, buildSearchAnimeUrl } from "./apis/dandan-api.js";
-import { getRedisKey, pingRedis, setRedisKey, setRedisKeyWithExpiry } from "./utils/redis-util.js";
+import { extractTitleSeasonEpisode, getBangumi, getComment, getCommentByUrl, matchAnime, searchAnime, buildSearchAnimeUrl } from "./apis/dandan-api.js";
+import { handleFavoriteRefresh } from './apis/favorite-api.js';
+import { handleClearCache } from './apis/system-api.js';
+import { getRedisCaches, getRedisKey, pingRedis, setRedisKey, setRedisKeyWithExpiry, updateRedisCaches } from "./utils/redis-util.js";
 import { getLocalRedisKey, setLocalRedisKey, setLocalRedisKeyWithExpiry } from "./utils/local-redis-util.js";
 import { getImdbepisodes } from "./utils/imdb-util.js";
 import { getTMDBChineseTitle, getTmdbJpDetail, searchTmdbTitles } from "./utils/tmdb-util.js";
@@ -26,6 +28,7 @@ import LeshiSource from "./sources/leshi.js";
 import XiguaSource from "./sources/xigua.js";
 import MaiduiduiSource from "./sources/maiduidui.js";
 import AiyifanSource from "./sources/aiyifan.js";
+import HongguoSource, { parseHongguoPlayerUrl } from "./sources/hongguo.js";
 import AnimekoSource from "./sources/animeko.js";
 import OtherSource from "./sources/other.js";
 import { NodeHandler } from "./configs/handlers/node-handler.js";
@@ -36,9 +39,15 @@ import { EdgeoneHandler } from "./configs/handlers/edgeone-handler.js";
 import { HuggingfaceHandler } from "./configs/handlers/huggingface-handler.js";
 import { HandlerFactory } from "./configs/handlers/handler-factory.js";
 import { Globals } from "./configs/globals.js";
-import { addAnime, addEpisode } from "./utils/cache-util.js";
+import { addAnime, addEpisode, getSearchCache, hasSeasonSpecificPreference, isSearchCacheValid, setSearchCache } from "./utils/cache-util.js";
+import { addFavorite, listFavorites, loadFavorites, removeFavorite, resolveFavoriteForKeyword, saveFavorites } from './utils/favorite-util.js';
+import { candidateMatchesMappingQualifiers, candidateMatchesMappingTitle, parseAutoMatchMappingRules, resolveAutoMatchMapping } from './utils/auto-match-mapping-util.js';
+import { HTML_TEMPLATE } from './ui/template.js';
+import { apitestJsContent } from './ui/js/apitest.js';
+import { systemSettingsJsContent } from './ui/js/systemsettings.js';
+import { previewJsContent } from './ui/js/preview.js';
 import { convertToAsciiSum } from "./utils/codec-util.js";
-import { handleDanmusLike } from "./utils/danmu-util.js";
+import { convertToDanmakuJson, handleDanmusLike } from "./utils/danmu-util.js";
 import { Segment, SegmentListResponse } from "./models/dandan-model.js"
 import { initBangumiData, searchBangumiData, clearBangumiDataCache } from "./utils/bangumi-data-util.js";
 
@@ -111,6 +120,45 @@ function resetSearchState() {
   delete Globals.requestAnimeDetailsMap;
 }
 
+function resetFavoriteState(env = {}) {
+  Globals.init(env);
+  Globals.animes = [];
+  Globals.episodeIds = [];
+  Globals.episodeNum = 10001;
+  Globals.searchCache = new Map();
+  Globals.commentCache = new Map();
+  Globals.favoriteCache = new Map();
+  Globals.requestHistory = new Map();
+  Globals.localCacheValid = false;
+  Globals.localCacheInitialized = false;
+}
+
+function createFavoriteAnime(title = '收藏测试', episodeCount = 2, id = 910001) {
+  return {
+    animeId: id,
+    bangumiId: String(id),
+    animeTitle: title,
+    type: 'tvseries',
+    typeDescription: 'TV',
+    imageUrl: 'https://example.com/favorite.jpg',
+    startDate: '2026-01-01T00:00:00.000Z',
+    episodeCount,
+    rating: 0,
+    isFavorited: true,
+    source: 'tencent',
+    links: Array.from({ length: episodeCount }, (_, index) => ({
+      id: id * 10 + index + 1,
+      url: `https://v.qq.com/x/cover/favorite/ep${index + 1}.html`,
+      title: `【qq】 第${index + 1}集`
+    }))
+  };
+}
+
+function favoriteSearchResult(anime) {
+  const { links, ...result } = anime;
+  return result;
+}
+
 const urlPrefix = "http://localhost:9321";
 const token = "87654321";
 
@@ -129,6 +177,7 @@ test('worker.js API endpoints', async (t) => {
   const xiguaSource = new XiguaSource();
   const maiduiduiSource = new MaiduiduiSource();
   const aiyifanSource = new AiyifanSource();
+  const hongguoSource = new HongguoSource();
   const animekoSource = new AnimekoSource();
   const otherSource = new OtherSource();
 
@@ -245,6 +294,715 @@ test('worker.js API endpoints', async (t) => {
 
     ({title, season, episode} = await extractTitleSeasonEpisode("宇宙Marry Me? S02E08"));
     assert(title === "宇宙Marry Me?" && season == 2 && episode == 8, `Expected title === "宇宙Marry Me?" && season == 2 && episode == 8, but got ${title} ${season} ${episode}`);
+  });
+
+  await t.test('auto match mapping table', async t => {
+    await t.test('falls back when Unicode property escapes are unavailable', async () => {
+      const NativeRegExp = globalThis.RegExp;
+      globalThis.RegExp = function (pattern, flags) {
+        if (String(pattern).includes('\\p{')) throw new SyntaxError('Unicode property escapes are unavailable');
+        return new NativeRegExp(pattern, flags);
+      };
+
+      try {
+        const compat = await import('./utils/auto-match-mapping-util.js?unicode-properties=unavailable');
+        const { rules, warnings } = compat.parseAutoMatchMappingRules('進撃の巨人 S01E01->ＳＰＹ×ＦＡＭＩＬＹ S01E03');
+
+        assert.deepEqual(warnings, []);
+        assert.equal(compat.resolveAutoMatchMapping(rules, { title: '進撃の 巨人！', season: 1, episode: 2 }).targetEpisode, 4);
+        assert.equal(compat.candidateMatchesMappingTitle({ animeTitle: 'SPY FAMILY' }, rules[0]), true);
+      } finally {
+        globalThis.RegExp = NativeRegExp;
+      }
+    });
+
+    await t.test('parses and resolves open, bounded, qualified, and platform rules', () => {
+      const { rules, warnings } = parseAutoMatchMappingRules([
+        '永生 S05E02->永生 S01E58',
+        '永生 S05E02~03->永生 S01E58~59',
+        '海贼王 S2E1->航海王(1999)【动漫】 S1E62',
+        '航海王 S1E1->航海王 S1E1 @qiyi'
+      ].join(';'), Globals.envs.allowedPlatforms);
+
+      assert.deepEqual(warnings, []);
+      assert.equal(rules.length, 4);
+      assert.equal(resolveAutoMatchMapping(rules, { title: '永生', season: 5, episode: 2 }).bounded, true);
+      assert.equal(resolveAutoMatchMapping(rules, { title: '永生', season: 5, episode: 3 }).targetEpisode, 59);
+      assert.equal(resolveAutoMatchMapping(rules, { title: '永生', season: 5, episode: 4 }).targetEpisode, 60);
+      assert.equal(resolveAutoMatchMapping(rules, { title: '永生', season: 6, episode: 1 }), null);
+
+      const qualified = rules[2];
+      assert.equal(qualified.targetTitle, '航海王');
+      assert.equal(qualified.targetYear, 1999);
+      assert.equal(qualified.targetType, '动漫');
+      assert.equal(rules[3].targetPlatform, 'qiyi');
+      assert.equal(candidateMatchesMappingQualifiers({
+        animeTitle: '航海王(1999)【动漫】from tencent',
+        typeDescription: '动漫',
+        startDate: '1999-10-20T00:00:00.000Z'
+      }, qualified), true);
+      assert.equal(candidateMatchesMappingQualifiers({
+        animeTitle: '航海王(2000)【动漫】from tencent',
+        typeDescription: '动漫',
+        startDate: '2000-01-01T00:00:00.000Z'
+      }, qualified), false);
+      assert.equal(candidateMatchesMappingTitle({ animeTitle: '航海王 第二季(1999)【动漫】from tencent' }, qualified), true);
+      assert.equal(candidateMatchesMappingTitle({ animeTitle: '海贼王(1999)【动漫】from tencent' }, qualified), false);
+
+      const boundedOnly = parseAutoMatchMappingRules('永生 S05E02~03->永生 S01E58~59').rules;
+      assert.equal(resolveAutoMatchMapping(boundedOnly, { title: '永生', season: 5, episode: 3 }).targetEpisode, 59);
+      assert.equal(resolveAutoMatchMapping(boundedOnly, { title: '永生', season: 5, episode: 4 }), null);
+
+      const narutoRule = parseAutoMatchMappingRules('火影忍者 S01E57->火影忍者 疾风传(2007)【日番】 S01E59').rules[0];
+      assert.equal(resolveAutoMatchMapping([narutoRule], { title: '火影忍者', season: 1, episode: 57 }).targetEpisode, 59);
+      assert.equal(resolveAutoMatchMapping([narutoRule], { title: '火影忍者', season: 1, episode: 58 }).targetEpisode, 60);
+      assert.equal(candidateMatchesMappingQualifiers({
+        animeTitle: '火影忍者疾风传(2007)【动漫】from 360',
+        typeDescription: '动漫',
+        startDate: '2007-02-15T00:00:00.000Z'
+      }, narutoRule), true);
+    });
+
+    await t.test('rejects invalid ranges and keeps declaration order for equal specificity', () => {
+      const parsed = parseAutoMatchMappingRules([
+        '测试 S01E02~04->测试 S01E10~11',
+        '测试 S01E02~03->测试 S01E20~21',
+        '测试 S01E02~03->测试 S01E30~31'
+      ].join(';'));
+      assert.equal(parsed.warnings.length, 1);
+      assert.equal(parsed.rules.length, 2);
+      assert.equal(resolveAutoMatchMapping(parsed.rules, { title: '测试', season: 1, episode: 2 }).targetEpisode, 20);
+    });
+
+    await t.test('uses the latest open-rule transition for repeated source title and season', () => {
+      const parsed = parseAutoMatchMappingRules([
+        '一念永恒 S01E53->一念永恒 S02E01',
+        '一念永恒 S01E107->一念永恒 S03E01',
+        '一念永恒 S01E166->一念永恒 完结季 S01E01'
+      ].join(';'));
+
+      assert.equal(resolveAutoMatchMapping(parsed.rules, { title: '一念永恒', season: 1, episode: 52 }), null);
+      assert.equal(resolveAutoMatchMapping(parsed.rules, { title: '一念永恒', season: 1, episode: 53 }).targetSeason, 2);
+      assert.equal(resolveAutoMatchMapping(parsed.rules, { title: '一念永恒', season: 1, episode: 106 }).targetEpisode, 54);
+      assert.equal(resolveAutoMatchMapping(parsed.rules, { title: '一念永恒', season: 1, episode: 107 }).targetSeason, 3);
+      assert.equal(resolveAutoMatchMapping(parsed.rules, { title: '一念永恒', season: 1, episode: 165 }).targetEpisode, 59);
+      assert.equal(resolveAutoMatchMapping(parsed.rules, { title: '一念永恒', season: 1, episode: 166 }).targetTitle, '一念永恒 完结季');
+    });
+
+    await t.test('maps match input, honors qualifiers and manual season preference, then falls back to original', async () => {
+      const originalSearch = TencentSource.prototype.search;
+      const originalHandleAnimes = TencentSource.prototype.handleAnimes;
+      const originalGetComments = TencentSource.prototype.getComments;
+      const originalAiAsk = AIClient.prototype.ask;
+      const originalOrder = Globals.envs.sourceOrderArr;
+      const originalAiValid = Globals.aiValid;
+      let searchKeywords = [];
+      let aiMatchInput = null;
+      let scenario = 'open';
+
+      TencentSource.prototype.search = async keyword => {
+        searchKeywords.push(keyword);
+        return [{ keyword }];
+      };
+      TencentSource.prototype.handleAnimes = async (_source, title, results, details) => {
+        const add = anime => {
+          results.push(anime);
+          details.set(String(anime.animeId), anime);
+        };
+        if (scenario === 'fallback' && title === '缺失目标') return;
+        if (scenario === 'qualified' && title === '航海王') {
+          add(createFavoriteAnime('无关动漫(1999)【动漫】from tencent', 70, 930000));
+          add(createFavoriteAnime('航海王(2000)【动漫】from tencent', 70, 930001));
+          add(createFavoriteAnime('航海王(1999)【动漫】from tencent', 70, 930002));
+          return;
+        }
+        if (scenario === 'platform') {
+          const qqAnime = createFavoriteAnime(title, 2, 930004);
+          const qiyiAnime = createFavoriteAnime(title, 2, 930005);
+          qiyiAnime.source = 'iqiyi';
+          qiyiAnime.links.forEach(link => { link.title = link.title.replace('【qq】', '【qiyi】'); });
+          add(qqAnime);
+          add(qiyiAnime);
+          return;
+        }
+        if (scenario === 'naruto') {
+          if (title === '火影忍者 疾风传') {
+            add(createFavoriteAnime('火影忍者疾风传(2007)【动漫】from 360', 70, 930006));
+          } else {
+            add(createFavoriteAnime('火影忍者(2002)【动漫】from 360', 70, 930007));
+          }
+          return;
+        }
+        add(createFavoriteAnime(title, 70, 930003));
+      };
+      TencentSource.prototype.getComments = async () => [{ p: '1,1,16777215,test', m: 'mapping-test' }];
+      Globals.envs.sourceOrderArr = ['tencent'];
+
+      const runMatch = async (env, fileName, useAi = false) => {
+        resetFavoriteState(env);
+        Globals.envs.sourceOrderArr = ['tencent'];
+        Globals.aiValid = useAi;
+        const request = new Request('http://localhost/api/v2/match', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ fileName })
+        });
+        return parseResponse(await matchAnime(new URL(request.url), request, '127.0.0.1'));
+      };
+
+      try {
+        searchKeywords = [];
+        scenario = 'open';
+        let body = await runMatch({ AUTO_MATCH_MAPPING_TABLE: '永生 S05E02->永生 S01E58' }, '永生 S05E03');
+        assert.equal(body.matches[0].episodeId, 9300030 + 59);
+        assert.deepEqual(searchKeywords, ['永生']);
+        await getComment(`/api/v2/comment/${body.matches[0].episodeId}`, 'json', false, '127.0.0.1');
+        assert.equal(hasSeasonSpecificPreference('永生', 5), false);
+        await getComment(`/api/v2/comment/${9300030 + 60}`, 'json', false, '127.0.0.1');
+        assert.equal(hasSeasonSpecificPreference('永生', 5), true);
+        assert.match(Globals.lastSelectMap.get('永生').offsets['5'], /^3:/);
+
+        body = await runMatch({ AUTO_MATCH_MAPPING_TABLE: '永生 S05E02->永生 S01E58' }, '永生 S06E01');
+        assert.equal(body.matches[0].episodeId, 9300030 + 1);
+        await getComment(`/api/v2/comment/${body.matches[0].episodeId}`, 'json', false, '127.0.0.1');
+        assert.equal(hasSeasonSpecificPreference('永生', 6), false);
+
+        resetFavoriteState({ AUTO_MATCH_MAPPING_TABLE: '永生 S05E02->永生 S01E58' });
+        Globals.envs.sourceOrderArr = ['tencent'];
+        Globals.lastSelectMap.set('永生', {
+          animeIds: [930003],
+          preferBySeason: { default: 930003 },
+          sourceBySeason: { default: 'tencent' }
+        });
+        const defaultPreferenceRequest = new Request('http://localhost/api/v2/match', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ fileName: '永生 S05E03' })
+        });
+        body = await parseResponse(await matchAnime(new URL(defaultPreferenceRequest.url), defaultPreferenceRequest, '127.0.0.1'));
+        assert.equal(body.matches[0].episodeId, 9300030 + 59);
+
+        AIClient.prototype.ask = async prompt => {
+          aiMatchInput = JSON.parse(prompt);
+          return JSON.stringify({ animeIndex: 0 });
+        };
+        body = await runMatch({ AUTO_MATCH_MAPPING_TABLE: '永生 S05E02->永生 S01E58' }, '永生 S05E03', true);
+        assert.equal(body.matches[0].episodeId, 9300030 + 59);
+        assert.deepEqual(
+          { title: aiMatchInput.title, season: aiMatchInput.season, episode: aiMatchInput.episode },
+          { title: '永生', season: 1, episode: 59 }
+        );
+        AIClient.prototype.ask = originalAiAsk;
+        Globals.aiValid = false;
+
+        scenario = 'qualified';
+        body = await runMatch({ AUTO_MATCH_MAPPING_TABLE: '海贼王 S02E01->航海王(1999)【动漫】 S01E62' }, '海贼王 S02E01');
+        assert.equal(body.matches[0].animeId, 930002);
+        assert.equal(body.matches[0].episodeId, 9300020 + 62);
+
+        body = await runMatch({ AUTO_MATCH_MAPPING_TABLE: '海贼王 S02E01->航海王(1998)【动漫】 S01E62' }, '海贼王 S02E01');
+        assert.equal(body.matches[0].animeId, 930001);
+
+        scenario = 'platform';
+        body = await runMatch({ AUTO_MATCH_MAPPING_TABLE: '航海王 S01E01->航海王 S01E01 @qiyi' }, '航海王 S01E01 @qq');
+        assert.equal(body.matches[0].animeId, 930005);
+
+        scenario = 'naruto';
+        resetFavoriteState({ AUTO_MATCH_MAPPING_TABLE: '火影忍者 S01E57->火影忍者 疾风传(2007)【日番】 S01E59' });
+        Globals.envs.sourceOrderArr = ['tencent'];
+        Globals.lastSelectMap.set('火影忍者', {
+          animeIds: [930007],
+          preferBySeason: { 1: 930007 },
+          sourceBySeason: { 1: '360' },
+          offsets: { 1: '58:【youku】 第58集' }
+        });
+        assert.equal(hasSeasonSpecificPreference('火影忍者', 1), false);
+        const narutoRequest = new Request('http://localhost/api/v2/match', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ fileName: '火影忍者 S01E58' })
+        });
+        body = await parseResponse(await matchAnime(new URL(narutoRequest.url), narutoRequest, '127.0.0.1'));
+        assert.equal(body.matches[0].animeId, 930006);
+        assert.equal(body.matches[0].episodeId, 9300060 + 60);
+
+        scenario = 'open';
+        resetFavoriteState({ AUTO_MATCH_MAPPING_TABLE: '永生 S05E02->永生 S01E58' });
+        Globals.envs.sourceOrderArr = ['tencent'];
+        Globals.lastSelectMap.set('永生', {
+          animeIds: [930003],
+          preferBySeason: { 5: 930003 },
+          sourceBySeason: { 5: 'tencent' },
+          offsets: { 5: '2:【qq】 第10集' },
+          explicitBySeason: { 5: true }
+        });
+        assert.equal(hasSeasonSpecificPreference('永生', 5), true);
+        const manualRequest = new Request('http://localhost/api/v2/match', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ fileName: '永生 S05E03' })
+        });
+        body = await parseResponse(await matchAnime(new URL(manualRequest.url), manualRequest, '127.0.0.1'));
+        assert.equal(body.matches[0].episodeId, 9300030 + 11);
+        assert.equal(Globals.lastSelectMap.get('永生').explicitBySeason['5'], true);
+
+        resetFavoriteState({
+          AUTO_MATCH_MAPPING_TABLE: '永生 S05E02->永生 S01E58',
+          REMEMBER_LAST_SELECT: 'false'
+        });
+        Globals.envs.sourceOrderArr = ['tencent'];
+        Globals.lastSelectMap.set('永生', {
+          animeIds: [930003],
+          preferBySeason: { 5: 930003 },
+          sourceBySeason: { 5: 'tencent' },
+          offsets: { 5: '2:【qq】 第10集' },
+          explicitBySeason: { 5: true }
+        });
+        const disabledPreferenceRequest = new Request('http://localhost/api/v2/match', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ fileName: '永生 S05E03' })
+        });
+        body = await parseResponse(await matchAnime(new URL(disabledPreferenceRequest.url), disabledPreferenceRequest, '127.0.0.1'));
+        assert.equal(body.matches[0].episodeId, 9300030 + 59);
+
+        searchKeywords = [];
+        scenario = 'fallback';
+        body = await runMatch({ AUTO_MATCH_MAPPING_TABLE: '原始剧 S01E01->缺失目标 S01E01' }, '原始剧 S01E01');
+        assert.equal(body.matches[0].animeTitle, '原始剧');
+        assert.deepEqual(searchKeywords, ['缺失目标', '原始剧']);
+      } finally {
+        TencentSource.prototype.search = originalSearch;
+        TencentSource.prototype.handleAnimes = originalHandleAnimes;
+        TencentSource.prototype.getComments = originalGetComments;
+        AIClient.prototype.ask = originalAiAsk;
+        Globals.envs.sourceOrderArr = originalOrder;
+        Globals.aiValid = originalAiValid;
+      }
+    });
+  });
+
+  await t.test('danmu text conversion should run after normalization and before filtering and grouping', () => {
+    const baseEnv = {
+      BLOCKED_WORDS: '',
+      GROUP_MINUTE: '0',
+      DANMU_LIMIT: '0',
+      CONVERT_COLOR: 'default'
+    };
+
+    Globals.init({ ...baseEnv, DANMU_SIMPLIFIED_TRADITIONAL: 'simplified' });
+    const simplified = convertToDanmakuJson([
+      { progress: 1000, mode: 1, color: 16777215, content: '來看能不能發彈幕' },
+      { p: '2,1,16777215,[test]', m: '繁體彈幕' }
+    ], 'bilibili1');
+    assert.deepEqual(simplified.map(item => item.m), ['来看能不能发弹幕', '繁体弹幕']);
+
+    Globals.init({
+      ...baseEnv,
+      DANMU_SIMPLIFIED_TRADITIONAL: 'simplified',
+      BLOCKED_WORDS: '/来看/'
+    });
+    const filtered = convertToDanmakuJson([
+      { progress: 1000, mode: 1, color: 16777215, content: '來看' }
+    ], 'bilibili1');
+    assert.equal(filtered.length, 0);
+
+    Globals.init({
+      ...baseEnv,
+      DANMU_SIMPLIFIED_TRADITIONAL: 'simplified',
+      GROUP_MINUTE: '1'
+    });
+    const grouped = convertToDanmakuJson([
+      { progress: 1000, mode: 1, color: 16777215, content: '來看' },
+      { p: '2,1,16777215,[test]', m: '来看' }
+    ], 'bilibili1');
+    assert.equal(grouped.length, 1);
+    assert.match(grouped[0].m, /^来看.*2$/);
+
+    Globals.init({ ...baseEnv, DANMU_SIMPLIFIED_TRADITIONAL: 'traditional' });
+    const traditional = convertToDanmakuJson([
+      { p: '1,1,16777215,[test]', m: '来看能不能发弹幕' }
+    ], 'test');
+    assert.equal(traditional[0].m, '來看能不能發彈幕');
+
+    resetSearchState();
+  });
+
+  await t.test('Upstash Redis persists favorites without storing search or comment caches', async () => {
+    resetFavoriteState({
+      UPSTASH_REDIS_REST_URL: 'https://redis.example.com',
+      UPSTASH_REDIS_REST_TOKEN: 'test-token',
+      LOG_LEVEL: 'error'
+    });
+    Globals.redisValid = true;
+    Globals.redisCacheInitialized = false;
+    Globals.lastHashes = {
+      animes: null,
+      episodeIds: null,
+      episodeNum: null,
+      lastSelectMap: null,
+      reqRecords: null,
+      todayReqNum: null,
+      favoriteCache: null
+    };
+
+    const anime = createFavoriteAnime('Redis cache test');
+    Globals.searchCache.set('Redis search', {
+      results: [favoriteSearchResult(anime)],
+      details: [anime],
+      timestamp: Date.now()
+    });
+    Globals.commentCache.set('https://example.com/video', {
+      comments: [{ p: '1,1,16777215,test', m: 'cached' }],
+      timestamp: Date.now()
+    });
+    addFavorite('Redis favorite', [favoriteSearchResult(anime)], [anime]);
+    Globals.favoriteCache.get('Redis favorite').timestamp = Date.now() - 24 * 60 * 60 * 1000;
+    Globals.lastSelectMap.set('Redis preference', {
+      animeIds: [anime.animeId],
+      preferBySeason: { 1: anime.animeId },
+      sourceBySeason: { 1: 'tencent' },
+      explicitBySeason: { 1: true }
+    });
+
+    const redisData = new Map();
+    const redisCommands = [];
+    await withMockFetch(async (_url, options) => {
+      const commands = JSON.parse(options.body);
+      redisCommands.push(...commands);
+      return {
+        json: async () => commands.map(command => {
+          if (command[0] === 'SET') {
+            redisData.set(command[1], command[2]);
+            return { result: 'OK' };
+          }
+          return { result: redisData.get(command[1]) ?? null };
+        })
+      };
+    }, async () => {
+      await updateRedisCaches();
+      assert.ok(redisData.has('favoriteCache'));
+      assert.equal(redisData.has('searchCache'), false);
+      assert.equal(redisData.has('commentCache'), false);
+
+      Globals.searchCache = new Map();
+      Globals.commentCache = new Map();
+      Globals.favoriteCache = new Map();
+      Globals.redisCacheInitialized = false;
+      await getRedisCaches();
+    });
+
+    assert.equal(Globals.searchCache.size, 0);
+    assert.equal(Globals.commentCache.size, 0);
+    assert.equal(redisCommands.some(command => command[1] === 'searchCache'), false);
+    assert.equal(redisCommands.some(command => command[1] === 'commentCache'), false);
+    assert.equal(resolveFavoriteForKeyword('Redis favorite')?.entry.results[0].animeId, anime.animeId);
+    assert.equal(getSearchCache('Redis favorite')[0].animeId, anime.animeId);
+    assert.equal(Globals.lastSelectMap.get('Redis preference').explicitBySeason['1'], true);
+
+    Globals.redisValid = false;
+  });
+
+  await t.test('clearing runtime caches preserves favorites and auto match mapping configuration', async () => {
+    resetFavoriteState({
+      AUTO_MATCH_MAPPING_TABLE: '火影忍者 S01E57->火影忍者 疾风传(2007)【日番】 S01E59',
+      LOG_LEVEL: 'error'
+    });
+    const anime = createFavoriteAnime('火影忍者');
+    addFavorite('火影忍者', [favoriteSearchResult(anime)], [anime]);
+    Globals.lastSelectMap.set('火影忍者', {
+      animeIds: [anime.animeId],
+      preferBySeason: { 1: anime.animeId },
+      sourceBySeason: { 1: 'tencent' },
+      explicitBySeason: { 1: true }
+    });
+
+    const response = await handleClearCache();
+    const body = await parseResponse(response);
+    assert.equal(body.success, true);
+    assert.equal(Globals.lastSelectMap.size, 0);
+    assert.equal(resolveFavoriteForKeyword('火影忍者')?.entry.results[0].animeId, anime.animeId);
+    assert.equal(Globals.envs.autoMatchMappingTable.length, 1);
+  });
+
+  await t.test('favorite cache', async t => {
+    await t.test('add/list/remove and serialization round trip', () => {
+      resetFavoriteState();
+      const anime = createFavoriteAnime();
+      const entry = addFavorite('收藏测试_S1', [favoriteSearchResult(anime)], [anime]);
+
+      assert.equal(entry.results.length, 1);
+      assert.equal(Globals.favoriteCache.size, 1);
+      assert.equal(listFavorites()[0].episodeCount, 2);
+      assert.equal(listFavorites()[0].lastRefreshAt, entry.lastRefreshAt);
+      assert.equal(resolveFavoriteForKeyword('收藏测试剧场版')?.entry, entry);
+
+      const snapshot = saveFavorites();
+      Globals.favoriteCache = new Map();
+      loadFavorites(JSON.stringify(snapshot));
+      assert.deepEqual(saveFavorites(), snapshot);
+      assert.equal(removeFavorite('收藏测试 第二季'), true);
+      assert.equal(Globals.favoriteCache.size, 0);
+    });
+
+    await t.test('favorite entries ignore search TTL, sweep, and count limits', () => {
+      resetFavoriteState({ SEARCH_CACHE_MINUTES: '1', LOG_LEVEL: 'error' });
+      const anime = createFavoriteAnime();
+      const oldTimestamp = Date.now() - 24 * 60 * 60 * 1000;
+      addFavorite('收藏测试', [favoriteSearchResult(anime)], [anime]);
+      Globals.favoriteCache.get('收藏测试').timestamp = oldTimestamp;
+      Globals.searchCache.set('收藏测试', { results: [], details: [], timestamp: oldTimestamp });
+      Globals.searchCache.set('普通过期缓存', { results: [], details: [], timestamp: oldTimestamp });
+
+      setSearchCache('新缓存', [], new Map());
+
+      assert.equal(isSearchCacheValid('收藏测试_S9'), true);
+      assert.equal(getSearchCache('收藏测试_S9')[0].animeId, anime.animeId);
+      assert.equal(Globals.favoriteCache.has('收藏测试'), true);
+      assert.equal(Globals.searchCache.has('收藏测试'), true);
+      assert.equal(Globals.searchCache.has('普通过期缓存'), false);
+
+      for (let index = 0; index < 510; index++) addFavorite(`无限收藏${index}`, [], []);
+      assert.equal(Globals.favoriteCache.size, 511);
+    });
+
+    await t.test('search and match short-circuit external sources and expose isFavorite', async () => {
+      resetFavoriteState();
+      const anime = createFavoriteAnime();
+      addFavorite('收藏测试', [favoriteSearchResult(anime)], [anime]);
+      let fetchCount = 0;
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async () => {
+        fetchCount++;
+        throw new Error('favorite hit must not use fetch');
+      };
+
+      try {
+        const searchResponse = await searchAnime(new URL('http://localhost/api/v2/search/anime?keyword=收藏测试&season=1&episode=2'));
+        const searchBody = await parseResponse(searchResponse);
+        assert.equal(searchBody.animes[0].animeId, anime.animeId);
+
+        const request = new Request('http://localhost/api/v2/match', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ fileName: '收藏测试 S01E02' })
+        });
+        const matchBody = await parseResponse(await matchAnime(new URL(request.url), request, '127.0.0.1'));
+        assert.equal(matchBody.isMatched, true);
+        assert.equal(matchBody.matches[0].episodeId, anime.links[1].id);
+        assert.equal(matchBody.matches[0].isFavorite, true);
+        assert.equal(fetchCount, 0);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    await t.test('partial search keyword does not reuse a longer favorite title', async () => {
+      resetFavoriteState();
+      const favoriteAnime = createFavoriteAnime('火影忍者', 2, 910011);
+      const searchAnimeResult = createFavoriteAnime('忍者战士飞影', 2, 910012);
+      addFavorite('火影忍者', [favoriteSearchResult(favoriteAnime)], [favoriteAnime]);
+      Globals.searchCache.set('忍者', {
+        results: [favoriteSearchResult(searchAnimeResult)],
+        details: [searchAnimeResult],
+        timestamp: Date.now()
+      });
+
+      assert.equal(getSearchCache('火影忍者_S1')[0].animeId, favoriteAnime.animeId);
+      assert.equal(getSearchCache('忍者')[0].animeId, searchAnimeResult.animeId);
+
+      const response = await searchAnime(new URL('http://localhost/api/v2/search/anime?keyword=忍者'));
+      const body = await parseResponse(response);
+      assert.equal(body.animes[0].animeId, searchAnimeResult.animeId);
+    });
+
+    await t.test('favorite API add/list/remove follows token path normalization', async () => {
+      resetFavoriteState();
+      const anime = createFavoriteAnime('路由收藏测试');
+      Globals.searchCache.set('路由收藏测试_S1', {
+        results: [favoriteSearchResult(anime)],
+        details: [anime],
+        timestamp: Date.now()
+      });
+
+      const defaultTokenResponse = await handleRequest(
+        new Request('http://localhost/api/v2/favorite/list'),
+        {}, 'cloudflare', '127.0.0.1', {}
+      );
+      assert.equal(defaultTokenResponse.status, 200);
+
+      const customTokenEnv = { TOKEN: 'favorite-user-token' };
+      const publicListResponse = await handleRequest(
+        new Request('http://localhost/api/v2/favorite/list'),
+        customTokenEnv, 'cloudflare', '127.0.0.1', {}
+      );
+      assert.equal(publicListResponse.status, 200);
+
+      const unauthorizedResponse = await handleRequest(
+        new Request('http://localhost/api/v2/favorite/remove', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ keyword: '路由收藏测试' })
+        }),
+        customTokenEnv, 'cloudflare', '127.0.0.1', {}
+      );
+      assert.equal(unauthorizedResponse.status, 401);
+
+      const addResponse = await handleRequest(new Request('http://localhost/api/v2/favorite/add', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ fileName: '路由收藏测试 S01E01' })
+      }), {}, 'cloudflare', '127.0.0.1', {});
+      assert.equal(addResponse.status, 200);
+      assert.equal((await parseResponse(addResponse)).isFavorite, true);
+
+      const listResponse = await handleRequest(
+        new Request('http://localhost/87654321/api/favorite/list'),
+        {}, 'cloudflare', '127.0.0.1', {}
+      );
+      const listBody = await parseResponse(listResponse);
+      assert.equal(listBody.favorites.length, 1);
+      assert.equal(listBody.favorites[0].animeTitle, '路由收藏测试');
+
+      const removeResponse = await handleRequest(new Request('http://localhost/87654321/api/favorite/remove', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ keyword: listBody.favorites[0].keyword })
+      }), {}, 'cloudflare', '127.0.0.1', {});
+      assert.equal(removeResponse.status, 200);
+      assert.equal(Globals.favoriteCache.size, 0);
+      assert.equal(Globals.searchCache.has('路由收藏测试_S1'), false);
+    });
+
+    await t.test('favorite API can require ADMIN_TOKEN', async () => {
+      const env = {
+        TOKEN: '87654321',
+        ADMIN_TOKEN: 'favorite-admin-token',
+        FAVORITE_REQUIRE_ADMIN: 'true'
+      };
+      resetFavoriteState(env);
+
+      const publicListResponse = await handleRequest(
+        new Request('http://localhost/api/v2/favorite/list'),
+        env, 'cloudflare', '127.0.0.1', {}
+      );
+      assert.equal(publicListResponse.status, 200);
+
+      const userResponse = await handleRequest(
+        new Request('http://localhost/87654321/api/v2/favorite/add', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ keyword: '权限测试' })
+        }),
+        env, 'cloudflare', '127.0.0.1', {}
+      );
+      assert.equal(userResponse.status, 403);
+      assert.equal((await parseResponse(userResponse)).message, '权限不足');
+
+      const adminResponse = await handleRequest(
+        new Request('http://localhost/favorite-admin-token/api/v2/favorite/list'),
+        env, 'cloudflare', '127.0.0.1', {}
+      );
+      assert.equal(adminResponse.status, 200);
+      assert.deepEqual((await parseResponse(adminResponse)).favorites, []);
+    });
+
+    await t.test('manual favorite keeps the search keyword and uses the first result image', async () => {
+      resetFavoriteState();
+      const anime = createFavoriteAnime('火影忍者 疾风传', 720, 915001);
+      Globals.searchCache.set('火影忍者', {
+        results: [favoriteSearchResult(anime)],
+        details: [anime],
+        timestamp: Date.now()
+      });
+
+      const addResponse = await handleRequest(new Request('http://localhost/api/v2/favorite/add', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ keyword: '火影忍者' })
+      }), {}, 'cloudflare', '127.0.0.1', {});
+      const addBody = await parseResponse(addResponse);
+      assert.equal(addResponse.status, 200);
+      assert.equal(addBody.keyword, '火影忍者');
+      assert.equal(addBody.animeTitle, '火影忍者');
+      assert.equal(addBody.imageUrl, anime.imageUrl);
+
+      const listBody = await parseResponse(await handleRequest(
+        new Request('http://localhost/api/v2/favorite/list'),
+        {}, 'cloudflare', '127.0.0.1', {}
+      ));
+      assert.equal(listBody.favorites[0].keyword, '火影忍者');
+      assert.equal(listBody.favorites[0].animeTitle, '火影忍者');
+      assert.equal(listBody.favorites[0].imageUrl, anime.imageUrl);
+      assert.equal(listBody.favorites[0].resultsCount, 1);
+    });
+
+    await t.test('refresh always performs a new source search and rebuilds the favorite', async () => {
+      resetFavoriteState();
+      const oldAnime = createFavoriteAnime('刷新测试', 1, 920001);
+      const refreshedAnime = createFavoriteAnime('刷新测试', 3, 920002);
+      const originalTimestamp = Date.now() - 60_000;
+      const favorite = addFavorite('刷新测试', [favoriteSearchResult(oldAnime)], [oldAnime]);
+      favorite.timestamp = originalTimestamp;
+      favorite.lastRefreshAt = originalTimestamp;
+
+      const originalSearch = TencentSource.prototype.search;
+      const originalHandleAnimes = TencentSource.prototype.handleAnimes;
+      const originalOrder = Globals.envs.sourceOrderArr;
+      let searchCount = 0;
+      TencentSource.prototype.search = async () => {
+        searchCount++;
+        return [{}];
+      };
+      TencentSource.prototype.handleAnimes = async (_source, _title, results, details) => {
+        results.push(refreshedAnime);
+        details.set(String(refreshedAnime.animeId), refreshedAnime);
+      };
+      Globals.envs.sourceOrderArr = ['tencent'];
+
+      try {
+        const refreshRequest = new Request('http://localhost/api/v2/favorite/refresh', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ keyword: '刷新测试' })
+        });
+        const refreshResponse = await handleFavoriteRefresh(refreshRequest, new URL(refreshRequest.url));
+        assert.equal(refreshResponse.status, 200);
+        assert.equal(searchCount, 1);
+        assert.equal(resolveFavoriteForKeyword('刷新测试').entry.results[0].animeId, refreshedAnime.animeId);
+        assert.equal(resolveFavoriteForKeyword('刷新测试').entry.details[0].links.length, 3);
+        assert.equal(resolveFavoriteForKeyword('刷新测试').entry.timestamp, originalTimestamp);
+        assert.ok(resolveFavoriteForKeyword('刷新测试').entry.lastRefreshAt > originalTimestamp);
+        assert.equal(listFavorites()[0].lastRefreshAt, resolveFavoriteForKeyword('刷新测试').entry.lastRefreshAt);
+      } finally {
+        TencentSource.prototype.search = originalSearch;
+        TencentSource.prototype.handleAnimes = originalHandleAnimes;
+        Globals.envs.sourceOrderArr = originalOrder;
+      }
+    });
+
+    await t.test('frontend bundle contains working favorite controls', () => {
+      assert.match(HTML_TEMPLATE, /id="manual-favorite-btn"/);
+      assert.doesNotMatch(HTML_TEMPLATE, /id="auto-favorite-btn"/);
+      assert.match(HTML_TEMPLATE, /id="favorite-panel"/);
+      assert.match(HTML_TEMPLATE, /switchDanmuTestTab\('favorite'/);
+      assert.match(apitestJsContent, /function favoriteManualSearch\(\)/);
+      assert.match(apitestJsContent, /function setManualFavoriteButton/);
+      assert.match(apitestJsContent, /取消收藏 · /);
+      assert.match(apitestJsContent, /removing \? '\/api\/v2\/favorite\/remove'/);
+      assert.match(apitestJsContent, /JSON\.stringify\(\{ keyword \}\)/);
+      assert.match(apitestJsContent, /\/api\/v2\/favorite\/refresh/);
+      assert.match(apitestJsContent, /\/api\/v2\/favorite\/remove/);
+      assert.match(apitestJsContent, /最近刷新时间：/);
+      assert.doesNotMatch(systemSettingsJsContent, /switchCategory\('favorite'\)/);
+      assert.match(systemSettingsJsContent, /const isMergeSourcePairs = currentKey === 'MERGE_SOURCE_PAIRS'/);
+      assert.match(systemSettingsJsContent, /preventDuplicateSources && selectedSourceTokens\.has\(value\)/);
+      assert.match(systemSettingsJsContent, /String\(element\.dataset\.value \|\| ''\)\.split\('&'\)/);
+      assert.doesNotThrow(() => new Function(apitestJsContent));
+      assert.doesNotThrow(() => new Function(systemSettingsJsContent));
+      assert.doesNotThrow(() => new Function(previewJsContent));
+      assert.match(previewJsContent, /AUTO_MATCH_MAPPING_TABLE/);
+    });
   });
 
   // await t.test('GET /api/v2/comment/:id?format=json&duration=true should return segment duration and reuse comment cache', async () => {
@@ -1143,9 +1901,310 @@ test('worker.js API endpoints', async (t) => {
   //   assert(res.length >= 0, `Expected res.length >= 0, but got ${res.length}`);
   // });
 
+  // await t.test('GET hongguo danmu', async () => {
+  //   const episodeId = 'hongguo:v1:series-1:vid-1:60';
+  //   const originalFetchCommentWindow = hongguoSource.fetchCommentWindow;
+  //   hongguoSource.fetchCommentWindow = async (_info, startMs) => ({
+  //     comments: startMs === 0
+  //       ? [{ commentId: 'comment-1', offsetMs: 1500, text: 'first', diggCount: 7 }]
+  //       : [
+  //           { commentId: 'comment-1', offsetMs: 1500, text: 'first', diggCount: 7 },
+  //           { commentId: 'comment-2', offsetMs: 31500, text: 'second', diggCount: 3 },
+  //         ],
+  //     nextStart: startMs + 30000,
+  //     cursor: `cursor-${startMs}`,
+  //     hasMore: true,
+  //   });
+  //   try {
+  //     const res = await hongguoSource.getComments(episodeId, 'hongguo');
+  //     assert.equal(res.length, 2);
+  //     assert.deepEqual(res.map((item) => item.t), [1.5, 31.5]);
+  //     assert.match(res[0].p, /\[hongguo\]$/);
+  //   } finally {
+  //     hongguoSource.fetchCommentWindow = originalFetchCommentWindow;
+  //   }
+  // });
+
+  // await t.test('GET hongguo danmu segments', async () => {
+  //   const episodeId = 'hongguo:v1:series-1:vid-1:60';
+  //   const res = await hongguoSource.getComments(episodeId, 'hongguo', true);
+  //   assert.equal(res.type, 'hongguo');
+  //   assert.equal(res.duration, 60);
+  //   assert.equal(res.segmentList.length, 2);
+  //   assert.notEqual(res.segmentList[0].url, res.segmentList[1].url);
+  // });
+
+  // await t.test('GET hongguo segment danmu', async () => {
+  //   const originalFetchCommentWindow = hongguoSource.fetchCommentWindow;
+  //   hongguoSource.fetchCommentWindow = async () => ({
+  //     comments: [
+  //       { commentId: 'before', offsetMs: 29999, text: 'before', diggCount: 0 },
+  //       { commentId: 'inside', offsetMs: 31500, text: 'inside', diggCount: 2 },
+  //       { commentId: 'after', offsetMs: 60000, text: 'after', diggCount: 0 },
+  //     ],
+  //     nextStart: 60000,
+  //     cursor: '',
+  //     hasMore: false,
+  //   });
+  //   try {
+  //     const segment = Segment.fromJson({
+  //       type: 'hongguo',
+  //       segment_start: 30,
+  //       segment_end: 60,
+  //       url: 'hongguo:v1:series-1:vid-1:60#segment=30',
+  //     });
+  //     const res = await hongguoSource.getSegmentComments(segment);
+  //     assert.equal(res.length, 1);
+  //     assert.equal(res[0].m, 'inside');
+  //     assert.equal(res[0].t, 31.5);
+  //   } finally {
+  //     hongguoSource.fetchCommentWindow = originalFetchCommentWindow;
+  //   }
+  // });
+
+  // await t.test('Hongguo player URL should resolve the exact episode', async () => {
+  //   const playerUrl = 'https://hongguoduanju.com/player/7572458140411628568/7572460055539223614';
+  //   assert.deepEqual(parseHongguoPlayerUrl(playerUrl), {
+  //     seriesId: '7572458140411628568',
+  //     vid: '7572460055539223614',
+  //   });
+
+  //   const source = new HongguoSource();
+  //   let requestedSeriesId = '';
+  //   let detailRequests = 0;
+  //   source.getEpisodes = async (seriesId) => {
+  //     detailRequests++;
+  //     requestedSeriesId = seriesId;
+  //     return {
+  //       episodes: [
+  //         { index: 1, vid: '7572459982168280126', duration: 150 },
+  //         { index: 2, vid: '7572460055539223614', duration: 119 },
+  //       ],
+  //       imageUrl: '',
+  //     };
+  //   };
+
+  //   const segments = await source.getComments(playerUrl, 'hongguo', true);
+  //   assert.equal(requestedSeriesId, '7572458140411628568');
+  //   assert.equal(segments.duration, 119);
+  //   assert.equal(segments.segmentList.length, 4);
+  //   assert.equal(
+  //     segments.segmentList[0].url,
+  //     'hongguo:v1:7572458140411628568:7572460055539223614:119#segment=0',
+  //   );
+
+  //   source.fetchCommentWindow = async (info) => {
+  //     assert.equal(info.vid, '7572460055539223614');
+  //     return {
+  //       comments: [{ commentId: 'link-comment', offsetMs: 1500, text: '链接弹幕', diggCount: 2 }],
+  //       nextStart: 119000,
+  //       cursor: '',
+  //       hasMore: false,
+  //     };
+  //   };
+  //   const comments = await source.getComments(playerUrl, 'hongguo');
+  //   assert.equal(detailRequests, 1);
+  //   assert.equal(comments.length, 1);
+  //   assert.equal(comments[0].m, '链接弹幕');
+  // });
+
+  // await t.test('GET comments by Hongguo player URL should use resolved vid', async () => {
+  //   const seriesId = '7572458140411628568';
+  //   const vid = '7572460055539223614';
+  //   const playerUrl = `https://hongguoduanju.com/player/${seriesId}/${vid}`;
+  //   const requestedUrls = [];
+
+  //   const response = await withMockFetch(async (url) => {
+  //     requestedUrls.push(String(url));
+  //     if (String(url).includes('/novel/player/multi_video_detail/v1/')) {
+  //       return mockJsonResponse({
+  //         code: 0,
+  //         data: {
+  //           [seriesId]: {
+  //             video_data: {
+  //               video_list: [{ vid_index: 1, vid, duration: 119 }],
+  //             },
+  //           },
+  //         },
+  //       }, String(url));
+  //     }
+  //     if (String(url).includes(`/novel/commentapi/comment/list/${vid}/v1/`)) {
+  //       return mockJsonResponse({
+  //         code: 0,
+  //         data: {
+  //           data_list: [{
+  //             comment: {
+  //               comment_id: 'route-comment',
+  //               common: { content: { text: '路由弹幕' } },
+  //               expand: { offset_time: 1500 },
+  //               stat: { digg_count: 3 },
+  //             },
+  //           }],
+  //           common_list_info: { cursor: '', has_more: false },
+  //           extra: { next_query_danmaku_list_time: 119000 },
+  //         },
+  //       }, String(url));
+  //     }
+  //     throw new Error(`Unexpected Hongguo request: ${url}`);
+  //   }, () => getCommentByUrl(playerUrl, 'json', false));
+
+  //   const body = await parseResponse(response);
+  //   assert.equal(body.count, 1);
+  //   assert.equal(body.comments[0].m, '路由弹幕');
+  //   assert(requestedUrls.some((url) => url.includes('/novel/player/multi_video_detail/v1/')));
+  //   assert(requestedUrls.some((url) => url.includes(`/novel/commentapi/comment/list/${vid}/v1/`)));
+  // });
+
   // await t.test('GET other_server danmu', async () => {
   //   const res = await otherSource.getComments("https://www.bilibili.com/bangumi/play/ep1231564");
   //   assert(res.length > 2, `Expected res.length > 2, but got ${res.length}`);
+  // });
+
+  // await t.test('Hanjutv warmup should retry after failure and share concurrent promise', async () => {
+  //   const source = new HanjutvSource();
+  //   let attempts = 0;
+  //   let finishFirst;
+  //   source.buildMobileHeaders = async () => ({ uid: 'stable-uid', headers: {} });
+  //   source.warmupMobileIdentity = async () => {
+  //     attempts++;
+  //     if (attempts === 1) return new Promise(resolve => { finishFirst = resolve; });
+  //     return true;
+  //   };
+
+  //   const concurrent = [source.ensureMobileIdentityWarmed(), source.ensureMobileIdentityWarmed()];
+  //   await new Promise(resolve => setImmediate(resolve));
+  //   assert.equal(attempts, 1);
+  //   finishFirst(false);
+  //   await Promise.all(concurrent);
+  //   await source.ensureMobileIdentityWarmed();
+  //   await source.ensureMobileIdentityWarmed();
+  //   assert.equal(attempts, 2);
+  // });
+
+  // await t.test('Hanjutv details should stay fully parallel and preserve candidate order', async () => {
+  //   const source = new HanjutvSource();
+  //   const candidates = Array.from({ length: 6 }, (_, index) => ({ sid: `sid-${index}`, name: `顺序测试剧${index}` }));
+  //   const resolvers = new Map();
+  //   const started = [];
+  //   const previous = { animes: Globals.animes, episodeIds: Globals.episodeIds, episodeNum: Globals.episodeNum };
+  //   Globals.animes = [];
+  //   Globals.episodeIds = [];
+  //   Globals.episodeNum = 10001;
+  //   source.buildAnimePayload = anime => new Promise(resolve => {
+  //     started.push(anime.sid);
+  //     resolvers.set(anime.sid, resolve);
+  //   });
+  //   source.sortAndPushAnimesByYear = (items, target) => target.push(...items);
+
+  //   try {
+  //     const current = [];
+  //     const task = source.handleAnimes(candidates, '顺序测试剧', current, new Map());
+  //     await new Promise(resolve => setImmediate(resolve));
+  //     assert.deepEqual(started, candidates.map(item => item.sid));
+  //     [...candidates].reverse().forEach(anime => {
+  //       const index = candidates.indexOf(anime);
+  //       resolvers.get(anime.sid)({
+  //         summary: { animeId: 900000 + index, bangumiId: String(900000 + index), animeTitle: anime.name, type: '韩剧', typeDescription: '韩剧', imageUrl: '', startDate: '2025-01-01T00:00:00Z', episodeCount: 1, rating: 0, isFavorited: true, source: 'hanjutv' },
+  //         links: [{ name: '第1集', url: `hxq:${anime.sid}`, title: '【hanjutv】 第1集' }],
+  //       });
+  //     });
+  //     const expected = candidates.map(item => item.name);
+  //     assert.deepEqual((await task).map(item => item.animeTitle), expected);
+  //     assert.deepEqual(current.map(item => item.animeTitle), expected);
+  //     assert.deepEqual(Globals.animes.map(item => item.animeTitle), expected);
+  //   } finally {
+  //     Globals.animes = previous.animes;
+  //     Globals.episodeIds = previous.episodeIds;
+  //     Globals.episodeNum = previous.episodeNum;
+  //   }
+  // });
+
+  // await t.test('Hanjutv should merge only exact titles and disambiguate duplicate names', async () => {
+  //   const source = new HanjutvSource();
+  //   const getMergedPairs = (keyword, s5Items, tvItems) => source
+  //     .mergeSearchCandidates(keyword, s5Items, tvItems)
+  //     .resultList
+  //     .filter(item => item._variant === 'merged')
+  //     .map(item => [item.sid, item.tvSid])
+  //     .sort((left, right) => left[0].localeCompare(right[0]));
+
+  //   const taxi = source.mergeSearchCandidates('模范出租车', [
+  //     { sid: 's3', name: '模范出租车3' },
+  //     { sid: 's2', name: '模范出租车2' },
+  //   ], [
+  //     { sid: 't2', name: '模范出租车2' },
+  //     { sid: 't3', name: '模范出租车3' },
+  //   ]).resultList.filter(item => item._variant === 'merged');
+  //   assert.deepEqual(taxi.map(item => [item.name, item.tvSid]), [
+  //     ['模范出租车3', 't3'],
+  //     ['模范出租车2', 't2'],
+  //   ]);
+
+  //   const duplicate = source.mergeSearchCandidates('配对游戏', [
+  //     { sid: 's-new', name: '配对游戏', playMode: 100, publishTime: '2025-01-01', lastSerialNo: 6 },
+  //     { sid: 's-old', name: '配对游戏', playMode: 101, publishTime: '2024-01-01', lastSerialNo: 63 },
+  //   ], [
+  //     { sid: 't-old', name: '配对游戏', playMode: 101, publishTime: '2024-01-01', lastSerialNo: 63 },
+  //     { sid: 't-new', name: '配对游戏', playMode: 100, publishTime: '2025-01-01', lastSerialNo: 6 },
+  //   ]).resultList.filter(item => item._variant === 'merged');
+  //   assert.deepEqual(duplicate.map(item => item.tvSid), ['t-new', 't-old']);
+
+  //   const partialS5 = [
+  //     { sid: 's-unknown', name: '同名剧', playMode: 100, category: 1 },
+  //     { sid: 's-2025', name: '同名剧', playMode: 100, publishTime: '2025-01-01', category: 1 },
+  //   ];
+  //   const datedTv = [
+  //     { sid: 't-2025', name: '同名剧', playMode: 100, publishTime: '2025-01-01', category: 1 },
+  //   ];
+  //   for (const s5Order of [partialS5, [...partialS5].reverse()]) {
+  //     assert.deepEqual(getMergedPairs('同名剧', s5Order, datedTv), [['s-2025', 't-2025']]);
+  //   }
+
+  //   const ambiguousS5 = [
+  //     { sid: 's-a', name: '歧义剧', playMode: 100, category: 1 },
+  //     { sid: 's-b', name: '歧义剧', playMode: 100, category: 1 },
+  //   ];
+  //   const ambiguousTv = [{ sid: 't-only', name: '歧义剧', playMode: 100, category: 1 }];
+  //   assert.deepEqual(getMergedPairs('歧义剧', ambiguousS5, ambiguousTv), []);
+  //   assert.deepEqual(getMergedPairs('歧义剧', [...ambiguousS5].reverse(), ambiguousTv), []);
+
+  //   assert.deepEqual(getMergedPairs('待播剧', [
+  //     { sid: 's-upcoming', name: '待播剧', playMode: 100, category: 1 },
+  //   ], [
+  //     { sid: 't-upcoming', name: '待播剧', playMode: 100, category: 1 },
+  //   ]), [['s-upcoming', 't-upcoming']]);
+
+  //   const eliminationS5 = [
+  //     { sid: 's-known', name: '排除剧', playMode: 100, publishTime: '2025-01-01', category: 1 },
+  //     { sid: 's-left', name: '排除剧', playMode: 100, category: 1 },
+  //   ];
+  //   const eliminationTv = [
+  //     { sid: 't-left', name: '排除剧', playMode: 100, category: 1 },
+  //     { sid: 't-known', name: '排除剧', playMode: 100, publishTime: '2025-01-01', category: 1 },
+  //   ];
+  //   const expectedEliminationPairs = [['s-known', 't-known'], ['s-left', 't-left']];
+  //   for (const s5Order of [eliminationS5, [...eliminationS5].reverse()]) {
+  //     for (const tvOrder of [eliminationTv, [...eliminationTv].reverse()]) {
+  //       assert.deepEqual(getMergedPairs('排除剧', s5Order, tvOrder), expectedEliminationPairs);
+  //     }
+  //   }
+  // });
+
+  // await t.test('Hanjutv should parse search-pair years without confusing seconds and milliseconds', () => {
+  //   const source = new HanjutvSource();
+  //   assert.equal(source.getSearchPairYear({ publishTime: 888768000000 }), 1998);
+  //   assert.equal(source.getSearchPairYear({ publishTime: '956678400000' }), 2000);
+  //   assert.equal(source.getSearchPairYear({ publishTime: 1735689600 }), 2025);
+  //   assert.equal(source.getSearchPairYear({ publishTime: '20250101' }), 2025);
+  //   assert.equal(source.getSearchPairYear({ releaseTime: '2025-07-11T00:00:00Z' }), 2025);
+  //   assert.equal(source.getSearchPairYear({ publishTime: 0, searchMemo: '1998·韩剧·敬请期待' }), 1998);
+  //   assert.equal(source.getSearchPairYear({ publishTime: 'not-a-date' }), null);
+  //   assert.equal(source.getSearchPairYear({ publishTime: 253402300800000 }), null);
+
+  //   assert.equal(source.isMergeableSearchPair(
+  //     { name: '千禧剧', publishTime: 974788882000 },
+  //     { name: '千禧剧', publishTime: 974820151000 },
+  //   ), true);
   // });
 
   // await t.test('GET hanjutv search', async () => {
